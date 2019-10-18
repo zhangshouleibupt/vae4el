@@ -7,61 +7,126 @@ from config import Config
 import logging
 from tqdm import tqdm
 from dataset import ELDataset
-from torch.utils.data import Subset,DataLoader
+from torch.utils.data import Subset,DataLoader,RandomSampler
+from fairseq.data import Dictionary
+from sklearn.metrics import f1_score
+import numpy as np
+import os
+import  warnings
+import math
+warnings.filterwarnings("ignore")
 logger = logging.getLogger(__name__)
 device = torch.device('cuda:2') if torch.cuda.is_available() and Config['use_cuda'] else torch.device('cpu')
 
 class Trainner():
-    def __init__(self,config,model,dataset,criterion):
+    def __init__(self,config,model,dataset,criterion,mode='Train'):
         self.__dict__.update(config)
         self.model = model
         self.dataset = dataset
-        self.train_set = Subset(dataset,list(range(self.train_dataset_nums)))
-        self.test_set = Subset(dataset,list(range(self.train_dataset_nums+1,len(dataset))))
+        self.train_set = Subset(dataset,
+                                list(range(self.train_dataset_nums)))
+        self.test_set = Subset(dataset,
+                               list(range(self.train_dataset_nums,len(dataset))))
         self.criterion = criterion
         self.optimizer = optim.Adam(model.parameters(),lr=self.learning_rate)
-        self.writer = SummaryWriter('../runs')
-        self.cur_loss_iter_num = 0
-        self.precision = 0.0
-        self.recall = 0.0
-        self.f_score = 0.0
+        self.now_time = time.strftime("%m%d%-H%M-%S",time.localtime())
+        self.writer = SummaryWriter('../runs/'+self.now_time)
+        self.max_f1_on_test = 0.0
     def train(self):
+        print("the model tensorboad dir is in %s" %self.now_time)
         self.model.to(device)
-        sampler = RandomSampler(self.train_set)
-        train_dl = DataLoader(self.train_set,sampler=sampler,batch_size=self.batch_size)
+        train_dl = DataLoader(self.train_set,
+                              sampler=RandomSampler(self.train_set),
+                              batch_size=self.batch_size)
+        print('finished load train dataloader')
+        test_dl = DataLoader(self.test_set,
+                             sampler=RandomSampler(self.test_set),
+                             batch_size=self.batch_size,
+                             shuffle=False)
+        print('finished load test dataloader')
+        l1,l2 = len(train_dl),len(test_dl)
+        print('dataset len detail : %d batch in train, %d batch in test'%(l1,l2))
         for epoch in range(self.epochs):
-            self._update_parameters(train_dl,epoch)
-        logger.info('training finished the blow are the detail on train set')
-    def evaluate(self):
-        pass
-    def _update_parameters(self,dataloader,cur_epoch):
-        self.model.to(device)
-        l = len(dataloader)
-        for i,batch in tqdm(enumerate(dataloader)):
-            self.optimizer.zero_grad()
-            mention,entity,label = list(map(lambda x:x.to(device),batch))
-            out,mention_miu,mention_logvar,joint_miu,joint_logvar = model(mention,entity)
-            input = (prediction,mention_miu,mention_logvar,joint_miu,joint_logvar)
-            loss = self.criterion(*input)
-            loss.backward()
-            self.optimizer.step()
-            _,prediction = out.topk(out,1)
-            p,r,f_score = self._metrics(prediction,label)
-            if (cur_epoch * l + i + 1) % self.print_every == 0:
-                self.writer.add_scalar('loss',loss.item(),self.cur_loss_iter_num)
-                self.writer.add_scalar('precision',p,self.cur_loss_iter_num)
-                self.writer.add_scalar('recall',r,self.cur_loss_iter_num)
-                self.writer.add_scalar('f_score',f_score,self.cur_loss_iter_num)
-                self.cur_loss_iter_num += 1
-            logger.info('finished %d batch in epoch %d,the below are reporter in this batch' % (i, cur_epoch))
-            logger.info('loss is: %.2f, linking precion is: %.2f recall is: %.2f f_score is: %.2f' % (loss.item(), p, r, f_score))
-        logger.info('finished in %d epoch now loss still remain %d epochs still not meet early stopping'%(cur_epoch,self.epochs-cur_epoch-1))
-        #do some detail reporter on train set and eval set
+            for i,batch in enumerate(train_dl):
+                cur_iter_num = l1 * epoch + i + 1
+                #update the model parameters
+                loss_on_train , f1_on_train, acc_on_train = self._update_parameters(batch)
+                loss_test, f1_test,acc_test = self.evaluate([batch])
+                if cur_iter_num % self.check_interval == 0:
+                    loss_on_test,f1_on_test,acc_on_test = self.evaluate(test_dl)
+                    if f1_on_test > self.max_f1_on_test:
+                        self.max_f1_on_test = f1_on_test
+                        #use the f_score as the model name
+                        model_name = ("%.4f"%f1_on_test)[2:]
+                        self.save_checkpoint('%sf_score.model'%model_name)
+                    print('on test: (batch: %d, epoch: %d, loss: %.4f, f1: %.4f, acc: %.4f)'
+                            % (i + 1, epoch, loss_on_test, f1_on_test, acc_on_test))
+                if cur_iter_num % self.print_every == 0:
+                    print('on train : (batch: %d, epoch: %d, loss: %.4f, f1: %.4f, acc: %.4f)'
+                          %(i+1,epoch,loss_on_train,f1_on_train,acc_on_train))
+                    self.writer.add_scalar('loss_on_train',loss_on_train,cur_iter_num)
+                    self.writer.add_scalar('f1_on_train',f1_on_train,cur_iter_num)
+        print('training finished the blow are the detail on train set')
 
+    def evaluate(self,batch_iter):
+        self.model.eval()
+        l = len(batch_iter)
+        acc,f1,loss = 0,0,0
+        prediction,label = None,None
+        for batch in batch_iter:
+            mention,entity,label = list(map(lambda x:x.to(device),batch))
+            out_items  = None
+            with torch.no_grad():
+                out_items = self.model(mention,entity)
+            out_items = list(map(lambda x:x.detach(),out_items))
+            out,mention_miu,mention_logvar,joint_miu,joint_logvar = out_items
+            tmp_loss = loss_func(out,label,mention_miu,mention_logvar,joint_miu,joint_logvar)
+            loss += tmp_loss.item()
+            prediction = out.argmax(dim=-1).squeeze()
+            acc += torch.sum(prediction==label).item() / label.numel()
+            prediction = prediction.cpu().numpy()
+            label = label.cpu().numpy()
+            f1 += f1_score(label,prediction)
+        return loss / l, f1 / l, acc / l
+    def save_checkpoint(self,model_dir):
+        if not os.path.exists('../checkpoints'):
+            os.mkdir('../checkpoints')
+        this_train_save_to = os.path.join('../checkpoints',self.now_time)
+        if not os.path.exists(this_train_save_to):
+            os.mkdir(this_train_save_to)
+        this_model_save_to = os.path.join(this_train_save_to,model_dir)
+        torch.save(self.model,this_model_save_to)
+    def _update_parameters(self,batch):
+        self.model.to(device)
+        self.model.train()
+        self.optimizer.zero_grad()
+        mention,entity,label = list(map(lambda x:x.to(device),batch))
+        out,mention_miu,mention_logvar,joint_miu,joint_logvar = self.model(mention,entity)
+        input = (out,label,mention_miu,mention_logvar,joint_miu,joint_logvar)
+        loss = self.criterion(*input)
+        loss.backward()
+        self.optimizer.step()
+        #cal acc just in gpu cause the speed is faster and method is simple
+        prediction = out.detach().argmax(dim=-1).squeeze()
+        acc = torch.sum(prediction==label).item() / torch.numel(label)
+        prediction = prediction.cpu().numpy()
+        label = label.cpu().numpy()
+        f1 = f1_score(label,prediction)
+        return loss.item(),f1,acc
 def main():
-    whole_dataset = EDLDataset('../data/aida.data')
-    el_model = VAEEntityLinkingModel(config)
-    trainner = Trainner(el_model,whole_dataset,loss_func)
+    data_file = '../data/aida.data'
+    print('start load dataset from %s path'%data_file)
+    el_dict = Dictionary.load('../data/voc.dict')
+    print('finished loaded dict')
+    el_config = Config
+    el_config['voc_size'] = len(el_dict)
+    print('start prepare the raw data into tensor dataset')
+    whole_dataset = ELDataset(el_dict,data_file)
+    print('finished load dataset ')
+    el_model = VAEEntityLinkingModel(el_config)
+    el_model.init_weights()
+    print('start training the model')
+    trainner = Trainner(el_config,el_model,whole_dataset,loss_func)
     trainner.train()
 if __name__ == "__main__":
     main()
